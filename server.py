@@ -1,5 +1,4 @@
-# server.py
-import json
+# fast_server.py
 import time
 import asyncio
 import logging
@@ -8,8 +7,11 @@ from typing import Set, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-# --- logging config: goes to stdout immediately ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# --- logging config: fast, stdout only, no blocking handlers ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("ws")
 
 app = FastAPI()
@@ -34,6 +36,21 @@ def metrics():
         "connected_clients": len(CLIENTS),
     })
 
+async def broadcast(message: str, exclude: WebSocket = None):
+    """Send message to all connected clients except optionally one."""
+    dead = []
+    for ws in CLIENTS:
+        if ws is exclude:
+            continue
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        CLIENTS.discard(ws)
+        CLIENT_META.pop(ws, None)
+        log.info(f"Pruned dead WS {ws}")
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -42,39 +59,23 @@ async def websocket_endpoint(ws: WebSocket):
     CLIENT_META[ws] = {"connected_at": time.time(), "peer": peer}
     log.info(f"WS connected from {peer}. Active: {len(CLIENTS)}")
 
-    # keep-alive pings
-    async def pinger():
-        while True:
-            await asyncio.sleep(25)
-            try:
-                await ws.send_text("ping")
-            except Exception:
-                break
-
-    ping_task = asyncio.create_task(pinger())
-
     try:
         while True:
             msg = await ws.receive_text()
             m = msg.strip()
 
-            if m.lower() == "now":
-                # print + flush (for safety) and also log
-                print("now", flush=True)
-                log.info("Received 'now' from %s", peer)
-                # do NOT reply to client
-                continue
-
-            # stay silent for everything else
-            # (you can uncomment these to help debug)
-            # log.debug("Ignoring message: %r", m)
-
+            if m.lower().startswith("now"):
+                # Broadcast immediately to all others
+                await broadcast(m, exclude=ws)
+                log.debug("Broadcast 'now' from %s to %d clients", peer, len(CLIENTS)-1)
+            else:
+                # Echo everything else too, so clients can see
+                await broadcast(m, exclude=ws)
     except WebSocketDisconnect:
         pass
     except Exception as e:
         log.warning("WS error from %s: %s", peer, e)
     finally:
-        ping_task.cancel()
         CLIENTS.discard(ws)
         CLIENT_META.pop(ws, None)
         log.info(f"WS disconnected {peer}. Active: {len(CLIENTS)}")
